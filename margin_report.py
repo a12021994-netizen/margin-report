@@ -14,8 +14,9 @@
 
 估算方法 (官方沒有公布個股融資維持率，這裡是推估值):
     * 第一天的融資餘額，成本假設為當天的成交均價
-    * 之後每天：賣出 + 現償 的部分依平均成本移出 (不影響平均成本)；
-      新增的融資部位以當天成交均價 (成交金額 ÷ 成交股數，沒有就用收盤價) 計入成本
+    * 之後每天：當天新增且留倉的部位 = 融資買進 − 資券互抵 (當沖不留倉)，
+      以當天成交均價 (成交金額 ÷ 成交股數，沒有就用收盤價) 計入成本；
+      其餘餘額視為舊部位，賣出 + 現償 依平均成本移出 (不影響平均成本)
     * 「成本換手率」= 目前融資餘額中，有多少比例是在觀察期間內買進的。
       數值越高代表初始假設的影響越小、推估越可信
 
@@ -39,7 +40,7 @@ OUTPUT_DIR = SCRIPT_DIR / "output"
 CACHE_DIR = SCRIPT_DIR / "margin_cache"   # 過去日期的原始資料快取 (GitHub Actions 用 actions/cache 保存)
 TEMPLATE_FILE = SCRIPT_DIR / "margin_template.html"
 
-LOOKBACK_CALENDAR_DAYS = 150   # 往回抓幾個日曆天 (約 100 個交易日)，越長成本推估越準
+LOOKBACK_CALENDAR_DAYS = 370   # 往回抓幾個日曆天 (約 250 個交易日)，越長成本推估越準；第一次跑較久，之後有快取
 REQUEST_DELAY_SEC = 1.6        # 每次對外請求間隔；TWSE / TPEx 交錯請求，同一主機約 3 秒一次
 FETCH_RETRIES = 3
 FETCH_RETRY_WAIT_SEC = 5
@@ -172,6 +173,7 @@ def fetch_twse_margin(d):
         f = t["fields"]
         if len(f) >= 8 and "代號" in norm(f[0]):
             # 欄位：代號 名稱 | 融資：買進 賣出 現金償還 前日餘額 今日餘額 次一營業日限額 | 融券 ...
+            i_off = find_col(f, "互抵", default=14 if len(f) > 14 else None)
             out = {}
             for r in t["data"]:
                 code = norm(r[0])
@@ -179,6 +181,7 @@ def fetch_twse_margin(d):
                     "name": norm(r[1]),
                     "buy": to_num(r[2]), "sell": to_num(r[3]), "repay": to_num(r[4]),
                     "prev": to_num(r[5]), "bal": to_num(r[6]), "limit": to_num(r[7]),
+                    "offset": to_num(r[i_off]) if i_off is not None and len(r) > i_off else None,
                 }
             return out or None
     return None
@@ -229,6 +232,9 @@ def fetch_tpex_margin(d):
         i_repay = find_col(f, "現償", default=5)
         i_bal = find_col(f, "資餘額", default=6, start=i_prev + 1)
         i_limit = find_col(f, "資限額", default=None)
+        i_off = find_col(f, "相抵")
+        if i_off is None:
+            i_off = find_col(f, "互抵")
         out = {}
         for r in rows:
             code = norm(r[0])
@@ -239,6 +245,7 @@ def fetch_tpex_margin(d):
                 "buy": to_num(r[i_buy]), "sell": to_num(r[i_sell]), "repay": to_num(r[i_repay]),
                 "prev": to_num(r[i_prev]), "bal": to_num(r[i_bal]),
                 "limit": to_num(r[i_limit]) if i_limit is not None else None,
+                "offset": to_num(r[i_off]) if i_off is not None and len(r) > i_off else None,
             }
         if out:
             return out
@@ -359,12 +366,15 @@ def estimate(market, days):
                 continue
 
             prev = m["prev"] if m["prev"] is not None else st["bal"]
-            outflow = (m["sell"] or 0) + (m["repay"] or 0)
-            remaining = max(min(prev, st["bal"]) - outflow, 0) if prev > 0 else 0
+            prev = min(prev, st["bal"]) if prev > 0 else 0
             if bal <= 0:
                 st.update(cost=None, bal=0, init=0)
             else:
-                remaining = min(remaining, bal)
+                # 今天真正新增、留到收盤的融資部位 = 融資買進 − 資券互抵 (當沖的部分當天就沖銷，不留倉)。
+                # 其餘的餘額都是舊部位，依平均成本計；賣出 / 現償 只會減少舊部位。
+                new_buy = max((m["buy"] or 0) - (m["offset"] or 0), 0) if m["buy"] is not None \
+                    else max(bal - prev, 0)
+                remaining = min(max(bal - new_buy, 0), prev)
                 inflow = bal - remaining
                 st["init"] = st["init"] * (remaining / st["bal"]) if st["bal"] > 0 else 0
                 st["cost"] = (st["cost"] * remaining + px * inflow) / bal
